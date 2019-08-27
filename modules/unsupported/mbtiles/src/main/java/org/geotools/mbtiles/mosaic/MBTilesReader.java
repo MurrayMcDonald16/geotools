@@ -19,6 +19,7 @@
 package org.geotools.mbtiles.mosaic;
 
 import java.awt.Color;
+import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
@@ -264,20 +265,22 @@ public class MBTilesReader extends AbstractGridCoverage2DReader {
                             metadata.getFormatStr() == null ? "png" : metadata.getFormatStr());
 
             if (image == null) {
-                image = getStartImage(tileImage, width, height);
+                image = getStartImageMODSIM(width, height);
             }
 
             // coordinates
             int posx = (int) (tile.getTileColumn() - leftTile) * DEFAULT_TILE_SIZE;
             int posy = (int) (topTile - tile.getTileRow()) * DEFAULT_TILE_SIZE;
 
-            image.getRaster().setRect(posx, posy, tileImage.getData());
+            //            image.getRaster().setRect(posx, posy, tileImage.getData());
+            Graphics g = image.getGraphics();
+            g.drawImage(tileImage, posx, posy, null);
         }
 
         it.close();
 
         if (image == null) { // no tiles ??
-            image = getStartImage(width, height);
+            image = getStartImageMODSIM(width, height);
         }
 
         return coverageFactory.create(
@@ -296,6 +299,19 @@ public class MBTilesReader extends AbstractGridCoverage2DReader {
         ImageReadParam param = reader.getDefaultReadParam();
 
         return reader.read(0, param);
+    }
+
+    protected BufferedImage getStartImageMODSIM(int width, int height) {
+        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+
+        // white background
+        Graphics2D g2D = (Graphics2D) image.getGraphics();
+        Color save = g2D.getColor();
+        g2D.setColor(Color.WHITE);
+        g2D.fillRect(0, 0, image.getWidth(), image.getHeight());
+        g2D.setColor(save);
+
+        return image;
     }
 
     protected BufferedImage getStartImage(BufferedImage copyFrom, int width, int height) {
