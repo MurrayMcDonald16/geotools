@@ -29,9 +29,11 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.sql.DataSource;
@@ -108,6 +110,31 @@ public class MBTilesFile implements AutoCloseable {
             }
         }
     }
+
+    // cache tile range information for each zoom level to avoid having to constantly query!
+    public static class ZoomLevelInfo {
+        public long zoomLevel;
+        public long minRow;
+        public long maxRow;
+        public long minColumn;
+        public long maxColumn;
+
+        public ZoomLevelInfo(
+                long zoomLevel, long minRow, long maxRow, long minColumn, long maxColumn) {
+            this.zoomLevel = zoomLevel;
+            this.minRow = minRow;
+            this.maxRow = maxRow;
+            this.minColumn = minColumn;
+            this.maxColumn = maxColumn;
+        }
+    }
+
+    // on first instantiation for a file the caller provides an empty map to loadZoomLevelInfoMap()
+    // on subsequent instantiations the caller should use setZoomLevelInfoMap(). At higher zoom
+    // levels having the tile range info cached is significantly more performant than querying for
+    // that data on each render
+    // Note that if zoomLevelInfoMap is null or empty everything functions as before
+    protected Map<Long, ZoomLevelInfo> zoomLevelInfoMap;
 
     // constant strings
     protected final String TABLE_METADATA = "metadata";
@@ -430,6 +457,35 @@ public class MBTilesFile implements AutoCloseable {
         return metaData;
     }
 
+    public void loadZoomLevelInfoMap(Map<Long, ZoomLevelInfo> zoomLevelInfoMap)
+            throws SQLException {
+        try (Connection cx = connPool.getConnection();
+                PreparedStatement ps =
+                        prepare(
+                                        cx,
+                                        format(
+                                                "SELECT zoom_level, MIN(tile_row), MAX(tile_row), MIN(tile_column), Max(tile_column) FROM %s GROUP BY zoom_level",
+                                                TABLE_TILES))
+                                .statement();
+                ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                ZoomLevelInfo zlInfo =
+                        new ZoomLevelInfo(
+                                rs.getLong(1), // zoom_level
+                                rs.getLong(2), // min_tile_row at zoom_level
+                                rs.getLong(3), // max_tile row at zoom_level
+                                rs.getLong(4), // min_tile_column at zoom_level
+                                rs.getLong(5)); // max_tile_column at zoom_level
+                zoomLevelInfoMap.put(zlInfo.zoomLevel, zlInfo);
+            }
+            setZoomLevelInfoMap(zoomLevelInfoMap);
+        }
+    }
+
+    public void setZoomLevelInfoMap(Map<Long, ZoomLevelInfo> zoomLevelInfoMap) {
+        this.zoomLevelInfoMap = zoomLevelInfoMap;
+    }
+
     public MBTilesTile loadTile(long zoomLevel, long column, long row) throws IOException {
         return loadTile(new MBTilesTile(zoomLevel, column, row));
     }
@@ -632,6 +688,24 @@ public class MBTilesFile implements AutoCloseable {
     }
 
     public long closestZoom(long zoomLevel) throws SQLException {
+        if (zoomLevelInfoMap != null && zoomLevelInfoMap.size() > 0) {
+            Set<Long> zooms = zoomLevelInfoMap.keySet();
+            if (zooms.contains(zoomLevel)) {
+                return zoomLevel;
+            } else {
+                long smallestDiff = Long.MAX_VALUE;
+                long closestZoom = 0;
+                for (long zl : zooms) {
+                    long diff = Math.abs(zoomLevel - zl);
+                    if (diff < smallestDiff) {
+                        smallestDiff = diff;
+                        closestZoom = zl;
+                    }
+                }
+                return closestZoom;
+            }
+        }
+
         long zoom = 0;
         try (Connection cx = connPool.getConnection();
                 PreparedStatement ps =
@@ -651,6 +725,10 @@ public class MBTilesFile implements AutoCloseable {
     }
 
     public long minZoom() throws SQLException {
+        if (zoomLevelInfoMap != null && zoomLevelInfoMap.size() > 0) {
+            return Collections.min(zoomLevelInfoMap.keySet());
+        }
+
         long zoom = 0;
 
         try (Connection cx = connPool.getConnection();
@@ -664,6 +742,10 @@ public class MBTilesFile implements AutoCloseable {
     }
 
     public long maxZoom() throws SQLException {
+        if (zoomLevelInfoMap != null && zoomLevelInfoMap.size() > 0) {
+            return Collections.max(zoomLevelInfoMap.keySet());
+        }
+
         long zoom = 0;
         try (Connection cx = connPool.getConnection();
                 Statement st = cx.createStatement();
@@ -671,11 +753,18 @@ public class MBTilesFile implements AutoCloseable {
             if (rs.next()) {
                 zoom = rs.getLong(1);
             }
+            return zoom;
         }
-        return zoom;
     }
 
     public long minColumn(long zoomLevel) throws SQLException {
+        if (zoomLevelInfoMap != null) {
+            ZoomLevelInfo zli = zoomLevelInfoMap.get(zoomLevel);
+            if (zli != null) {
+                return zli.minColumn;
+            }
+        }
+
         long size = 0;
         try (Connection cx = connPool.getConnection();
                 PreparedStatement ps =
@@ -695,6 +784,13 @@ public class MBTilesFile implements AutoCloseable {
     }
 
     public long maxColumn(long zoomLevel) throws SQLException {
+        if (zoomLevelInfoMap != null) {
+            ZoomLevelInfo zli = zoomLevelInfoMap.get(zoomLevel);
+            if (zli != null) {
+                return zli.maxColumn;
+            }
+        }
+
         long size = Long.MAX_VALUE;
 
         try (Connection cx = connPool.getConnection();
@@ -715,6 +811,13 @@ public class MBTilesFile implements AutoCloseable {
     }
 
     public long minRow(long zoomLevel) throws SQLException {
+        if (zoomLevelInfoMap != null) {
+            ZoomLevelInfo zli = zoomLevelInfoMap.get(zoomLevel);
+            if (zli != null) {
+                return zli.minRow;
+            }
+        }
+
         long size = 0;
 
         try (Connection cx = connPool.getConnection();
@@ -735,6 +838,13 @@ public class MBTilesFile implements AutoCloseable {
     }
 
     public long maxRow(long zoomLevel) throws SQLException {
+        if (zoomLevelInfoMap != null) {
+            ZoomLevelInfo zli = zoomLevelInfoMap.get(zoomLevel);
+            if (zli != null) {
+                return zli.maxRow;
+            }
+        }
+
         long size = Long.MAX_VALUE;
         try (Connection cx = connPool.getConnection();
                 PreparedStatement ps =

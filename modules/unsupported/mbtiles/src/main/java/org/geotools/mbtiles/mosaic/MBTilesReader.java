@@ -30,8 +30,14 @@ import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Hashtable;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import javax.imageio.ImageIO;
 import javax.imageio.ImageReadParam;
 import javax.imageio.ImageReader;
@@ -57,6 +63,9 @@ import org.opengis.referencing.crs.CoordinateReferenceSystem;
 
 public class MBTilesReader extends AbstractGridCoverage2DReader {
 
+    private static final Logger LOGGER =
+            org.geotools.util.logging.Logging.getLogger(MBTilesReader.class);
+
     static final CoordinateReferenceSystem SPHERICAL_MERCATOR;
 
     static final CoordinateReferenceSystem WGS_84;
@@ -80,6 +89,8 @@ public class MBTilesReader extends AbstractGridCoverage2DReader {
 
     protected MBTilesMetadata metadata;
 
+    protected Map<Long, MBTilesFile.ZoomLevelInfo> zoomLevelInfoMap = new HashMap<>();
+
     protected ReferencedEnvelope bounds;
 
     protected File sourceFile;
@@ -88,6 +99,13 @@ public class MBTilesReader extends AbstractGridCoverage2DReader {
         sourceFile = MBTilesFormat.getFileFromSource(source);
 
         MBTilesFile file = new MBTilesFile(sourceFile);
+
+        // prime the cache
+        try {
+            file.loadZoomLevelInfoMap(zoomLevelInfoMap);
+        } catch (SQLException ex) {
+            zoomLevelInfoMap.clear();
+        }
 
         metadata = file.loadMetaData();
 
@@ -127,7 +145,13 @@ public class MBTilesReader extends AbstractGridCoverage2DReader {
     @Override
     public GridCoverage2D read(GeneralParameterValue[] parameters)
             throws IllegalArgumentException, IOException {
+
+        Long startRead = System.currentTimeMillis();
+
         MBTilesFile file = new MBTilesFile(sourceFile);
+
+        // set new instance to use the cached zoom level information
+        file.setZoomLevelInfoMap(zoomLevelInfoMap);
 
         ReferencedEnvelope requestedEnvelope = null;
         Rectangle dim = null;
@@ -247,8 +271,6 @@ public class MBTilesReader extends AbstractGridCoverage2DReader {
                         offsetY + (topTile + 1) * resY,
                         SPHERICAL_MERCATOR);
 
-        BufferedImage image = null;
-
         MBTilesFile.TileIterator it;
         try {
             it = file.tiles(zoomLevel, leftTile, bottomTile, rightTile, topTile);
@@ -256,32 +278,37 @@ public class MBTilesReader extends AbstractGridCoverage2DReader {
             throw new IOException(e);
         }
 
-        while (it.hasNext()) {
-            MBTilesTile tile = it.next();
-
-            BufferedImage tileImage =
-                    readImage(
-                            tile.getData(),
-                            metadata.getFormatStr() == null ? "png" : metadata.getFormatStr());
-
-            if (image == null) {
-                image = getStartImageMODSIM(width, height);
-            }
-
-            // coordinates
-            int posx = (int) (tile.getTileColumn() - leftTile) * DEFAULT_TILE_SIZE;
-            int posy = (int) (topTile - tile.getTileRow()) * DEFAULT_TILE_SIZE;
-
-            //            image.getRaster().setRect(posx, posy, tileImage.getData());
-            Graphics g = image.getGraphics();
-            g.drawImage(tileImage, posx, posy, null);
-        }
-
+        // gather tiles into a list (with known size parallelization works better)
+        List<MBTilesTile> tiles = new ArrayList();
+        while (it.hasNext()) tiles.add(it.next());
         it.close();
 
-        if (image == null) { // no tiles ??
-            image = getStartImageMODSIM(width, height);
-        }
+        // now construct the complete image
+        BufferedImage image = getStartImage(BufferedImage.TYPE_INT_ARGB, width, height);
+        final Graphics graphics = image.getGraphics();
+
+        final long originLeft = leftTile;
+        final long originTop = topTile;
+
+        // use parallel processing to create individual tile images
+        tiles.parallelStream()
+                .map(tile -> new TileImage(tile, metadata.getFormatStr()))
+                .forEach(
+                        tileImage -> {
+                            // calc tile position
+                            int posx = (int) (tileImage.col - originLeft) * DEFAULT_TILE_SIZE;
+                            int posy = (int) (originTop - tileImage.row) * DEFAULT_TILE_SIZE;
+
+                            // use drawImage() to stitch the individual tile images together
+                            graphics.drawImage(tileImage.image, posx, posy, null);
+                        });
+
+        String msg =
+                String.format(
+                        "MBTiles at zoom level %d read completed in %d milliseconds",
+                        zoomLevel, System.currentTimeMillis() - startRead);
+
+        LOGGER.log(Level.FINE, msg);
 
         return coverageFactory.create(
                 metadata.getName() == null ? "nameless mbtiles" : metadata.getName(),
@@ -299,19 +326,6 @@ public class MBTilesReader extends AbstractGridCoverage2DReader {
         ImageReadParam param = reader.getDefaultReadParam();
 
         return reader.read(0, param);
-    }
-
-    protected BufferedImage getStartImageMODSIM(int width, int height) {
-        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
-
-        // white background
-        Graphics2D g2D = (Graphics2D) image.getGraphics();
-        Color save = g2D.getColor();
-        g2D.setColor(Color.WHITE);
-        g2D.fillRect(0, 0, image.getWidth(), image.getHeight());
-        g2D.setColor(save);
-
-        return image;
     }
 
     protected BufferedImage getStartImage(BufferedImage copyFrom, int width, int height) {
@@ -334,12 +348,7 @@ public class MBTilesReader extends AbstractGridCoverage2DReader {
                         copyFrom.isAlphaPremultiplied(),
                         properties);
 
-        // white background
-        Graphics2D g2D = (Graphics2D) image.getGraphics();
-        Color save = g2D.getColor();
-        g2D.setColor(Color.WHITE);
-        g2D.fillRect(0, 0, image.getWidth(), image.getHeight());
-        g2D.setColor(save);
+        setBackground(image, new Color(0x00000000, true)); // transparent background
 
         return image;
     }
@@ -348,18 +357,37 @@ public class MBTilesReader extends AbstractGridCoverage2DReader {
         if (imageType == BufferedImage.TYPE_CUSTOM) imageType = BufferedImage.TYPE_3BYTE_BGR;
 
         BufferedImage image = new BufferedImage(width, height, imageType);
-
-        // white background
-        Graphics2D g2D = (Graphics2D) image.getGraphics();
-        Color save = g2D.getColor();
-        g2D.setColor(Color.WHITE);
-        g2D.fillRect(0, 0, image.getWidth(), image.getHeight());
-        g2D.setColor(save);
+        setBackground(image, new Color(0x00000000, true)); // transparent background
 
         return image;
     }
 
     protected BufferedImage getStartImage(int width, int height) {
         return getStartImage(BufferedImage.TYPE_CUSTOM, width, height);
+    }
+
+    protected void setBackground(BufferedImage image, Color bgColor) {
+        Graphics2D g2D = (Graphics2D) image.getGraphics();
+        Color save = g2D.getColor();
+        g2D.setColor(bgColor);
+        g2D.fillRect(0, 0, image.getWidth(), image.getHeight());
+        g2D.setColor(save);
+    }
+
+    /** Tile converted into a BufferedImage -- this conversion is done in parallel */
+    static class TileImage {
+        long col;
+        long row;
+        BufferedImage image;
+
+        TileImage(MBTilesTile tile, String imageFormat) {
+            this.col = tile.getTileColumn();
+            this.row = tile.getTileRow();
+            try {
+                image = readImage(tile.getData(), imageFormat);
+            } catch (IOException ex) {
+                throw new RuntimeException("Failed to covert tile data to image");
+            }
+        }
     }
 }
